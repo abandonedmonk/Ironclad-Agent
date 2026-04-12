@@ -1,0 +1,23 @@
+# Environment and Python
+.venv/
+__pycache__/
+*.pyc
+.env
+
+# Rust
+target/
+Cargo.lock
+
+# Docs (as requested)
+docs/
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+*.log
+
+# Aider
+.aider*
+.aider*
