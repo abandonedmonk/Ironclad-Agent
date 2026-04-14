@@ -1,4 +1,4 @@
-.PHONY: all build run rust python clean
+.PHONY: all build run rust python smoke clean
 
 # ─── Build ────────────────────────────────────────────────────────────────────
 
@@ -26,6 +26,11 @@ rust-run:
 python-run:
 	@echo "🐍 Running LangGraph agent..."
 	uv run python agent/main.py
+
+## Run smoke tests (normal, network, filesystem, fuel)
+smoke:
+	@echo "🧪 Running smoke test suite..."
+	python tests/smoke/run_smoke.py
 
 # ─── Dev ──────────────────────────────────────────────────────────────────────
 
