@@ -17,6 +17,7 @@ docs/
 
 # Misc
 *.log
+.sandbox/
 
 # Aider
 .aider*
