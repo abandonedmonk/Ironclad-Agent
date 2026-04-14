@@ -1,8 +1,10 @@
 #![allow(unused)]
 
 use serde::Serialize;
-use wasmtime::{Engine, Module};
+use wasmtime::{Config, Engine, Linker, Module, Store};
+use wasmtime_wasi::{self, DirPerms, FilePerms, p1::WasiP1Ctx};
 
+/// Captures stdout/stderr from executed scripts
 #[derive(Debug, Clone, Serialize)]
 struct ExecutionOutput {
     stdout: String,
@@ -11,82 +13,129 @@ struct ExecutionOutput {
     error: Option<String>,
 }
 
-/// Execution contract for `ironclad-runtime`
-///
-/// * Input – a single argument: path to a `.py` script.
-/// * Output – JSON printed to stdout: { "stdout": "...", "stderr": "...", "exit_code": 0, "error": null }
-/// * Guarantees – no network, filesystem confined via WASI, fuel limits enforced, graceful error reporting.
+/// Defines our runtime's input/output contract
 fn main() -> wasmtime::Result<()> {
+    // Enable structured logging
     env_logger::init();
-    log::info!("Loading python.wasm into Wasmtime engine...");
+    log::info!("Booting Wasmtime engine...");
 
+    // Grab script path from CLI args
     let args: Vec<String> = std::env::args().collect();
     let script_path = match args.get(1) {
-        Some(path) => path.clone(),
+        Some(p) => p.clone(),
         None => {
+            // Bail with usage if no script provided
             let output = ExecutionOutput {
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: 1,
                 error: Some("Usage: ironclad-runtime <script_path>".to_string()),
             };
-            println!("{}", serde_json::to_string(&output).unwrap());
+            log::error!("{}", serde_json::to_string(&output).unwrap());
             std::process::exit(1);
         }
     };
 
-    log::info!("Script Path: {}", script_path);
-
+    // Validate script exists
+    log::info!("Checking: {}", script_path);
     if !std::path::Path::new(&script_path).exists() {
         let output = ExecutionOutput {
             stdout: String::new(),
             stderr: String::new(),
             exit_code: 1,
-            error: Some(format!("Script not found: {}", script_path)),
+            error: Some(format!("Missing script: {}", script_path)),
         };
-        println!("{}", serde_json::to_string(&output).unwrap());
+        log::error!("{}", serde_json::to_string(&output).unwrap());
         std::process::exit(1);
     }
 
-    log::info!("✅ Script validated.");
+    log::info!("✓ Script check passed");
 
-    // Step 3 contract shape: this is what the runtime will serialize to JSON.
-    let _contract_example = ExecutionOutput {
+    // Example of our JSON output format
+    let _demo = ExecutionOutput {
         stdout: String::new(),
         stderr: String::new(),
         exit_code: 0,
         error: None,
     };
     log::info!(
-        "Contract example => stdout='{}', stderr='{}', exit_code={}, error={:?}",
-        _contract_example.stdout,
-        _contract_example.stderr,
-        _contract_example.exit_code,
-        _contract_example.error
+        "Sample output: stdout='{}', stderr='{}', code={}, err={:?}",
+        _demo.stdout,
+        _demo.stderr,
+        _demo.exit_code,
+        _demo.error
     );
 
-    // The engine is the global compilation environment.
-    // Default config is fine for now — no fuel limits yet (Phase 2, Step 7).
+    // Ensure sandbox dir exists for WASI
+    std::fs::create_dir_all(".sandbox")?;
+
+    // Stage the requested script into the sandbox and run that guest path.
+    let host_script_in_sandbox = ".sandbox/script.py";
+    std::fs::copy(&script_path, host_script_in_sandbox)?;
+    let guest_script_path: &str = "/sandbox/script.py";
+
+    // Prepare WASM execution environment
     let engine = Engine::default();
+    let mut wasi_builder = wasmtime_wasi::WasiCtxBuilder::new();
+    // Allow stdio passthrough for debugging
+    wasi_builder.inherit_stdio();
+    // argv[0] program name and argv[1] script path in the guest filesystem
+    wasi_builder.arg("python.wasm");
+    wasi_builder.arg(guest_script_path);
+    // Mount our sandbox at /sandbox inside WASM
+    wasi_builder.preopened_dir(
+        "./.sandbox",     // Host path
+        "/sandbox",       // Guest path
+        DirPerms::all(),  // Permissions for dirs
+        FilePerms::all(), // Permissions for files
+    )?;
+    let wasi = wasi_builder.build_p1();
 
-    // Compile the .wasm binary into the engine.
-    // This does NOT execute anything — it just validates and compiles.
-    // The file path is relative to where `cargo run` is invoked (project root).
+    // Link WASI imports to our context
+    let mut linker = Linker::<WasiP1Ctx>::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| s)?;
+
+    // Load and validate the WASM module
     let wasm_path = "python-3.12.0.wasm";
-
-    match Module::from_file(&engine, wasm_path) {
-        Ok(module) => {
-            log::info!("✅ python.wasm loaded successfully.");
-            log::info!("   Exports: {}", module.exports().count());
-            log::info!("   Imports: {}", module.imports().count());
-            log::info!("\n🎯 Milestone achieved: Wasmtime can load the Python runtime.");
-            log::info!("   Next step → Phase 2, Step 4: execute a Python script inside it.");
-        }
+    let module = match Module::from_file(&engine, wasm_path) {
+        Ok(m) => m,
         Err(e) => {
-            log::error!("❌ Failed to load python.wasm: {}", e);
-            log::error!("   Make sure `python-3.12.0.wasm` is in the project root.");
+            log::error!("WASM load failed: {}", e);
+            log::error!("Put python-3.12.0.wasm in project root");
             std::process::exit(1);
         }
+    };
+
+    log::info!(
+        "✓ WASM ready ({} exports, {} imports)",
+        module.exports().count(),
+        module.imports().count()
+    );
+
+    // Prepare execution store with WASI context
+    let mut store = Store::new(&engine, wasi);
+
+    // Instantiate module with our imports
+    let _instance = linker.instantiate(&mut store, &module)?;
+    log::info!("✓ Module linked and instantiated");
+
+    // Try common WASI entry points across module styles.
+    if let Some(start) = _instance.get_func(&mut store, "_start") {
+        log::info!("Using '_start' entrypoint");
+        start.typed::<(), ()>(&store)?.call(&mut store, ())?;
+    } else if let Some(initialize) = _instance.get_func(&mut store, "_initialize") {
+        log::info!("Using '_initialize' entrypoint");
+        initialize.typed::<(), ()>(&store)?.call(&mut store, ())?;
+    } else {
+        let exports = module
+            .exports()
+            .map(|e| e.name().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(wasmtime::Error::msg(format!(
+            "No supported entrypoint found. Tried '_start' and '_initialize'. Exports: [{}]",
+            exports
+        )));
     }
 
     Ok(())
