@@ -12,9 +12,13 @@
 //! Output: JSON with { stdout, stderr, exit_code, error }
 
 use serde::Serialize;
+use std::time::Instant;
 use wasmtime::{Config, Engine, Linker, Module, Store, Trap};
 use wasmtime_wasi::{self, DirPerms, FilePerms, p1::WasiP1Ctx};
 
+mod audit;
+mod crypto;
+use audit::AuditEntry;
 // ============================================================================
 // CONFIGURATION & CONSTANTS
 // ============================================================================
@@ -217,6 +221,22 @@ fn main() -> wasmtime::Result<()> {
 
     log::info!("✓ Script check passed");
 
+    // Phase 4 / Step 12: hash script before execution.
+    let script_hash = match crypto::compute_script_sha256(std::path::Path::new(&script_path)) {
+        Ok(hash) => hash,
+        Err(e) => {
+            let output = ExecutionOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 1,
+                error: Some(format!("Failed to hash script: {}", e)),
+            };
+            log::error!("{}", serde_json::to_string(&output).unwrap());
+            std::process::exit(1);
+        }
+    };
+    log::info!("Script SHA-256: {}", script_hash);
+
     // ✅ Success criteria for debugging
     let _demo = ExecutionOutput {
         stdout: String::new(),
@@ -316,21 +336,45 @@ fn main() -> wasmtime::Result<()> {
     log::info!("✓ Module linked and instantiated");
 
     // ========================================================================
-    // Execute
+    // Execute and measure duration for audit logging
     // ========================================================================
 
-    // Call the entrypoint with centralized fuel error handling
+    // Capture start time before the sandbox call.
+    let exec_start = Instant::now();
+
+    // Call the entrypoint with centralized fuel error handling.
     let used_entrypoint =
         invoke_with_shared_handler(&mut store, &_instance, &module, ENTRYPOINT_CANDIDATES)?;
+
+    // Convert the elapsed time to milliseconds for the audit record.
+    let exec_duration_ms = exec_start.elapsed().as_millis();
 
     // Report fuel consumption for instrumentation/tuning
     let fuel_left = store.get_fuel()?;
     log::info!(
-        "Entrypoint '{}' completed. Fuel used: {} (remaining: {})",
+        "Entrypoint '{}' completed. Fuel used: {} (remaining: {}), Duration: {}ms",
         used_entrypoint,
         FUEL_BUDGET.saturating_sub(fuel_left),
-        fuel_left
+        fuel_left,
+        exec_duration_ms
     );
+
+    // ========================================================================
+    // Phase 4 Step 13: Build and append the audit log entry
+    // ========================================================================
+
+    // Build the record from the execution data we already have.
+    let audit_entry = &AuditEntry {
+        script_hash: script_hash.clone(),
+        timestamp_iso8601: time::OffsetDateTime::now_utc().to_string(),
+        duration_ms: exec_duration_ms,
+        exit_code: 0,
+        output_preview: String::new(),
+    };
+
+    audit::append_audit_entry(&audit_entry)?;
+
+    log::info!("Audit entry appended to audit.log");
 
     Ok(())
 }
