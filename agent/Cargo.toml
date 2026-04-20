@@ -1,0 +1,13 @@
+[package]
+name = "ironclad-agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rig = { package = "rig-core", version = "0.35.0" }
+tokio = { version = "1", features = ["full"] }  # Async runtime
+serde = { version = "1", features = ["derive"] }  # Serialization
+serde_json = "1"
+anyhow = "1.0.102"
+thiserror = "1.0"
+dotenvy = "0.15"
