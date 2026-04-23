@@ -298,6 +298,17 @@ fn main() -> wasmtime::Result<()> {
     // Keep debug metadata in debug builds only; it slows down release startup.
     config.debug_info(cfg!(debug_assertions));
     config.consume_fuel(true); // Enable per-instruction fuel counting
+    match wasmtime::Cache::from_file(None)
+        .or_else(|_| wasmtime::Cache::new(wasmtime::CacheConfig::new()))
+    {
+        Ok(cache) => {
+            config.cache(Some(cache));
+            log::info!("Wasmtime compilation cache enabled");
+        }
+        Err(error) => {
+            log::warn!("Wasmtime cache unavailable, continuing without cache: {}", error);
+        }
+    }
 
     // Create the WASM runtime engine (global shared state for compilation)
     let engine = Engine::new(&config).unwrap();
