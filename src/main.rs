@@ -18,7 +18,9 @@ use wasmtime_wasi::{self, DirPerms, FilePerms, p1::WasiP1Ctx};
 
 mod audit;
 mod crypto;
+mod verify;
 use audit::AuditEntry;
+
 // ============================================================================
 // CONFIGURATION & CONSTANTS
 // ============================================================================
@@ -36,13 +38,10 @@ const FUEL_DETECTION_USE_FALLBACK: bool = true;
 // DATA STRUCTURES
 // ============================================================================
 
-/// Describes one supported entrypoint: name and (future) signature.
-/// This struct grows over time to support more signature kinds.
+/// Describes one supported entrypoint.
 #[derive(Debug, Clone)]
 struct EntrypointSpec {
     name: &'static str,
-    // TODO: Add signature_kind field here when multiple signatures are supported
-    // Example: signature_kind: SignatureKind::Nullary,
 }
 
 /// All entrypoints this runtime knows how to call.
@@ -181,7 +180,7 @@ fn invoke_with_shared_handler(
 fn main() -> wasmtime::Result<()> {
     // Initialize logging with a sensible default when RUST_LOG is not set.
     // This keeps logs visible during normal `cargo run` usage.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .target(env_logger::Target::Stdout)
         .init();
     log::info!("Booting Wasmtime engine...");
@@ -191,15 +190,45 @@ fn main() -> wasmtime::Result<()> {
     // ========================================================================
 
     let args: Vec<String> = std::env::args().collect();
+
     let script_path = match args.get(1) {
-        Some(p) => p.clone(),
+        Some(flag) if flag == "--verify" => {
+            let verify_path = match args.get(2) {
+                Some(path) => path,
+                None => {
+                    let output = ExecutionOutput {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: 1,
+                        error: Some("Usage: ironclad-runtime --verify <script_path>".to_string()),
+                    };
+                    log::error!("{}", serde_json::to_string(&output).unwrap());
+                    std::process::exit(1);
+                }
+            };
+
+            if let Err(error) = verify::verify_script_execution(std::path::Path::new(verify_path)) {
+                let output = ExecutionOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 1,
+                    error: Some(format!("Verification failed: {}", error)),
+                };
+                log::error!("{}", serde_json::to_string(&output).unwrap());
+                std::process::exit(1);
+            }
+
+            std::process::exit(0);
+        }
+        Some(path) => path.clone(),
         None => {
-            // Missing CLI argument: print error and exit
             let output = ExecutionOutput {
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: 1,
-                error: Some("Usage: ironclad-runtime <script_path>".to_string()),
+                error: Some(
+                    "Usage: ironclad-runtime <script_path> | --verify <script_path>".to_string(),
+                ),
             };
             log::error!("{}", serde_json::to_string(&output).unwrap());
             std::process::exit(1);
@@ -266,7 +295,8 @@ fn main() -> wasmtime::Result<()> {
 
     // Configure Wasmtime engine with fuel tracking enabled
     let mut config = Config::new();
-    config.debug_info(true); // Include debug info for better error messages
+    // Keep debug metadata in debug builds only; it slows down release startup.
+    config.debug_info(cfg!(debug_assertions));
     config.consume_fuel(true); // Enable per-instruction fuel counting
 
     // Create the WASM runtime engine (global shared state for compilation)
