@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::time::Instant;
@@ -6,7 +6,7 @@ use time;
 
 /// One execution record in the audit log.
 /// Serializes to a single JSON line in audit.log.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     /// SHA-256 hash of the script file.
     pub script_hash: String,
@@ -25,17 +25,7 @@ pub struct AuditEntry {
 }
 
 /// Append one audit entry to audit.log as a JSON line.
-///
-/// This function must:
-/// 1. Open audit.log in append mode (file stays open, new lines added without editing old ones)
-/// 2. Serialize entry to JSON
-/// 3. Write JSON + newline to file
-/// 4. Return Ok(()) or propagate io::Error
-///
-/// Why append-only matters:
-/// - No entry can be edited or deleted after it's written
-/// - This creates an immutable audit trail
-/// - Verification in Step 14 will scan this log to prove execution
+/// Entries are immutable: opened in append-only mode so audit trail cannot be edited.
 pub fn append_audit_entry(entry: &AuditEntry) -> std::io::Result<()> {
     let mut file = OpenOptions::new()
         .append(true)
