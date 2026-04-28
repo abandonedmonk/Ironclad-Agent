@@ -1,7 +1,3 @@
-// Phase 3 Step 9: ReAct Agent with Rig + Cohere
-// This module implements a reasoning agent that iterates through thought/action/observation cycles.
-// The agent uses Cohere LLM for reasoning and can execute Python code via ironclad-runtime sandbox.
-
 use anyhow::Result;
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::Prompt;
@@ -199,7 +195,7 @@ impl Tool for ExecuteCodeTool {
     type Args = CodeArgs;
     type Output = String;
 
-    // Define tool schema for Gemini's tool calling system.
+    // Define tool schema for the execute_code tool.
     async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
         rig::completion::ToolDefinition {
             name: "execute_code".to_string(),

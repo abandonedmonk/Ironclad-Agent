@@ -1,43 +1,30 @@
-.PHONY: all build run rust python smoke clean
+.PHONY: all build run smoke clean
 
 # ─── Build ────────────────────────────────────────────────────────────────────
 
-## Build both the Rust runtime and verify the Python env
 all: build
 
-build: rust-build
-	@echo "✅ Full build complete."
-
-rust-build:
-	@echo "🦀 Building Rust runtime..."
+build:
+	@echo "🦀 Building Rust workspace..."
 	cargo build --release
+	@echo "✅ Build complete."
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
-## Run both: Rust runtime, then the LangGraph agent
-run: rust-run python-run
-
-## Run only the Rust binary
-rust-run:
+## Run the Rust runtime binary
+run:
 	@echo "🦀 Running ironclad-runtime..."
 	./target/release/ironclad-runtime
 
-## Run only the Python agent
-python-run:
-	@echo "🐍 Running LangGraph agent..."
-	uv run python agent/main.py
+## Run the ReAct agent
+agent:
+	@echo "🤖 Running ironclad-agent..."
+	./target/release/ironclad-agent
 
 ## Run smoke tests (normal, network, filesystem, fuel)
 smoke:
 	@echo "🧪 Running smoke test suite..."
 	python tests/smoke/run_smoke.py
-
-# ─── Dev ──────────────────────────────────────────────────────────────────────
-
-## Run Python without rebuilding Rust (fast iteration)
-dev:
-	@echo "🐍 Starting agent (dev mode)..."
-	uv run python agent/main.py
 
 # ─── Clean ────────────────────────────────────────────────────────────────────
 

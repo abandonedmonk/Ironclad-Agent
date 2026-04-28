@@ -1,4 +1,3 @@
-#![allow(unused)]
 
 //! # Ironclad Runtime — WASM Sandbox for Secure Script Execution
 //!
@@ -139,13 +138,6 @@ fn invoke_with_shared_handler(
         })?;
 
     // Step 2: Invoke the entrypoint with standard (nullary) signature
-    //
-    // TODO: When multiple signatures are needed, pattern-match on spec.signature_kind:
-    // let func = match spec.signature_kind {
-    //     SignatureKind::Nullary => instance.get_typed_func::<(), ()>(...),
-    //     SignatureKind::I32ToI32 => instance.get_typed_func::<(i32), i32>(...),
-    // };
-
     let func = instance.get_typed_func::<(), ()>(&mut *store, &entrypoint)?;
 
     // Step 3: Call and classify the result
@@ -250,7 +242,7 @@ fn main() -> wasmtime::Result<()> {
 
     log::info!("✓ Script check passed");
 
-    // Phase 4 / Step 12: hash script before execution.
+    // Hash the script before execution.
     let script_hash = match crypto::compute_script_sha256(std::path::Path::new(&script_path)) {
         Ok(hash) => hash,
         Err(e) => {
@@ -266,20 +258,6 @@ fn main() -> wasmtime::Result<()> {
     };
     log::info!("Script SHA-256: {}", script_hash);
 
-    // ✅ Success criteria for debugging
-    let _demo = ExecutionOutput {
-        stdout: String::new(),
-        stderr: String::new(),
-        exit_code: 0,
-        error: None,
-    };
-    log::info!(
-        "Sample output: stdout='{}', stderr='{}', code={}, err={:?}",
-        _demo.stdout,
-        _demo.stderr,
-        _demo.exit_code,
-        _demo.error
-    );
 
     // ========================================================================
     // Prepare Sandbox & WASM Environment
@@ -401,7 +379,7 @@ fn main() -> wasmtime::Result<()> {
     );
 
     // ========================================================================
-    // Phase 4 Step 13: Build and append the audit log entry
+    // Build and append the audit log entry
     // ========================================================================
 
     // Build the record from the execution data we already have.

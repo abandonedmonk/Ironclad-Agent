@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
-use std::io::{self, Write};
-use std::time::Instant;
-use time;
+use std::io::Write;
 
 /// One execution record in the audit log.
 /// Serializes to a single JSON line in audit.log.

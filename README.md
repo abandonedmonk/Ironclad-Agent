@@ -56,7 +56,10 @@ pip install -r requirements.txt
 ./target/release/ironclad-runtime tests/smoke/scripts/hello.py
 
 # Option 2: Start the AI agent
-python agent/main.py
+cargo run -p ironclad-agent -- "Calculate: 5 + 3 * 2"
+
+# If you built release binaries already, you can also run:
+# ./target/release/ironclad-agent "Calculate: 5 + 3 * 2"
 
 # Give it a task, e.g., "Calculate the 10th Fibonacci number"
 # Watch it generate code, execute it safely, and return the result
@@ -68,10 +71,9 @@ python agent/main.py
 
 The **4.26x speedup over Docker** comes from eliminating redundant JIT compilation via Wasmtime's integrated cache.
 
-```
+```text
 Scenario: Execute Python 3.12 interpreter 100 times
 
-┌─────────────────┬──────────┬───────────┬───────────┬──────────┐
 │ Runtime         │ Median   │ P95       │ P99       │ Min      │
 ├─────────────────┼──────────┼───────────┼───────────┼──────────┤
 │ Docker (alpine) │ 778 ms   │ 791 ms    │ 805 ms    │ 765 ms   │
@@ -228,7 +230,7 @@ print(proc.stdout)  # "Sum of 1-100: 5050"
 ### Example 2: Using the AI Agent
 
 ```bash
-python agent/main.py
+cargo run -p ironclad-agent -- "Find all prime numbers less than 100"
 
 # Agent prompt:
 # "Find all prime numbers less than 100"
@@ -318,6 +320,45 @@ cargo build --release --no-default-features
 
 ## 🧪 Testing
 
+### Run The Scripts
+
+Build the runtime first, then run each script against the sandbox binary. On Windows, use the `.exe` path; on Unix-like systems, use the release binary.
+
+```bash
+# Build once
+cargo build --release
+
+# Normal script
+./target/release/ironclad-runtime tests/smoke/scripts/test_normal.py
+
+# Network-isolation script
+./target/release/ironclad-runtime tests/smoke/scripts/test_network.py
+
+# Filesystem-isolation script
+./target/release/ironclad-runtime tests/smoke/scripts/test_filesystem_escape.py
+
+# Fuel-exhaustion script
+./target/release/ironclad-runtime tests/smoke/scripts/test_infinite.py
+```
+
+Windows equivalents:
+
+```powershell
+cargo build --release
+.\target\release\ironclad-runtime.exe tests\smoke\scripts\test_normal.py
+.\target\release\ironclad-runtime.exe tests\smoke\scripts\test_network.py
+.\target\release\ironclad-runtime.exe tests\smoke\scripts\test_filesystem_escape.py
+.\target\release\ironclad-runtime.exe tests\smoke\scripts\test_infinite.py
+```
+
+If you want to run everything in one pass, use the smoke harness:
+
+```bash
+python tests/smoke/run_smoke.py
+```
+
+The runtime appends JSONL entries to `audit.log` for successful executions, so you can verify what ran after the scripts finish.
+
 ### Smoke Tests
 
 ```bash
@@ -343,6 +384,7 @@ exit(0)
 ```bash
 # Run it
 ./target/release/ironclad-runtime tests/smoke/scripts/my_test.py
+.\target\release\ironclad-runtime tests\smoke\scripts\my_test.py
 ```
 
 ---

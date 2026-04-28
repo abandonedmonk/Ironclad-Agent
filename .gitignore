@@ -1,7 +1,8 @@
-# Environment and Python
-.venv/
+# Python (test harness scripts)
 __pycache__/
 *.pyc
+
+# Secrets
 .env
 
 # Rust
@@ -20,7 +21,6 @@ docs/
 .sandbox/
 
 # Aider
-.aider*
 .aider*
 
 .github

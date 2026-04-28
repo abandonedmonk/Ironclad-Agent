@@ -1,13 +1,11 @@
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 /// Compute SHA-256 for a script file and return lowercase hex.
-///
-/// Fill this function in during Phase 4 / Step 12.
 pub fn compute_script_sha256(path: &Path) -> std::io::Result<String> {
-    let mut file = File::open(path)?;
+    let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
 
