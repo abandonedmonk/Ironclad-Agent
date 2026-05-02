@@ -1,4 +1,3 @@
-
 //! # Ironclad Runtime — WASM Sandbox for Secure Script Execution
 //!
 //! This binary sandboxes Python scripts using WebAssembly (Wasmtime) and WASI.
@@ -11,14 +10,20 @@
 //! Output: JSON with { stdout, stderr, exit_code, error }
 
 use serde::Serialize;
+use std::collections::HashSet;
 use std::time::Instant;
 use wasmtime::{Config, Engine, Linker, Module, Store, Trap};
 use wasmtime_wasi::{self, DirPerms, FilePerms, p1::WasiP1Ctx};
 
 mod audit;
 mod crypto;
+mod packages;
 mod verify;
-use audit::AuditEntry;
+use packages::{
+    PackageApproval, PackageRequest, PackageResolutionConfig, build_package_error_json,
+    detect_forbidden_install_attempt, extract_package_requests_from_script, manifest_summary,
+    parse_package_list, resolve_packages,
+};
 
 // ============================================================================
 // CONFIGURATION & CONSTANTS
@@ -64,6 +69,98 @@ struct ExecutionOutput {
     exit_code: i32,
     /// Error message (Some if execution failed, None if succeeded).
     error: Option<String>,
+}
+
+#[derive(Debug)]
+struct RuntimeArgs {
+    script_path: Option<String>,
+    cli_packages: Vec<PackageRequest>,
+    verify_path: Option<String>,
+}
+
+fn parse_runtime_args(args: &[String]) -> Result<RuntimeArgs, String> {
+    let mut script_path = None;
+    let mut cli_packages = Vec::new();
+    let mut verify_path = None;
+
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--verify" => {
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| "Usage: ironclad-runtime --verify <script_path>".to_string())?;
+                verify_path = Some(path.clone());
+                break;
+            }
+            "--packages" => {
+                let packages = args.get(index + 1).ok_or_else(|| {
+                    "--packages requires a comma-separated package list".to_string()
+                })?;
+                cli_packages.extend(parse_package_list(packages));
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("Unknown flag: {}", value));
+            }
+            value => {
+                if script_path.is_none() {
+                    script_path = Some(value.to_string());
+                    index += 1;
+                } else {
+                    return Err(format!("Unexpected argument: {}", value));
+                }
+            }
+        }
+    }
+
+    Ok(RuntimeArgs {
+        script_path,
+        cli_packages,
+        verify_path,
+    })
+}
+
+fn emit_json_error_and_exit(message: String) -> ! {
+    let output = ExecutionOutput {
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: 1,
+        error: Some(message),
+    };
+    log::error!("{}", serde_json::to_string(&output).unwrap());
+    std::process::exit(1);
+}
+
+fn merge_package_requests(
+    cli_packages: Vec<PackageRequest>,
+    script_packages: Vec<PackageRequest>,
+) -> Vec<PackageRequest> {
+    let mut merged = cli_packages;
+    merged.extend(script_packages);
+    merged
+}
+
+fn build_pythonpath(approvals: &[PackageApproval], mount_path: &str) -> String {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mount_entry = mount_path.to_string();
+    if seen.insert(mount_entry.clone()) {
+        entries.push(mount_entry);
+    }
+
+    for approval in approvals {
+        if approval.wheel == "stdlib" {
+            continue;
+        }
+
+        if seen.insert(approval.mount_path.clone()) {
+            entries.push(approval.mount_path.clone());
+        }
+    }
+
+    entries.join(":")
 }
 
 // ============================================================================
@@ -182,49 +279,31 @@ fn main() -> wasmtime::Result<()> {
     // ========================================================================
 
     let args: Vec<String> = std::env::args().collect();
+    let runtime_args = match parse_runtime_args(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => emit_json_error_and_exit(error),
+    };
 
-    let script_path = match args.get(1) {
-        Some(flag) if flag == "--verify" => {
-            let verify_path = match args.get(2) {
-                Some(path) => path,
-                None => {
-                    let output = ExecutionOutput {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        exit_code: 1,
-                        error: Some("Usage: ironclad-runtime --verify <script_path>".to_string()),
-                    };
-                    log::error!("{}", serde_json::to_string(&output).unwrap());
-                    std::process::exit(1);
-                }
-            };
-
-            if let Err(error) = verify::verify_script_execution(std::path::Path::new(verify_path)) {
-                let output = ExecutionOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 1,
-                    error: Some(format!("Verification failed: {}", error)),
-                };
-                log::error!("{}", serde_json::to_string(&output).unwrap());
-                std::process::exit(1);
-            }
-
-            std::process::exit(0);
-        }
-        Some(path) => path.clone(),
-        None => {
+    if let Some(verify_path) = runtime_args.verify_path {
+        if let Err(error) = verify::verify_script_execution(std::path::Path::new(&verify_path)) {
             let output = ExecutionOutput {
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: 1,
-                error: Some(
-                    "Usage: ironclad-runtime <script_path> | --verify <script_path>".to_string(),
-                ),
+                error: Some(format!("Verification failed: {}", error)),
             };
             log::error!("{}", serde_json::to_string(&output).unwrap());
             std::process::exit(1);
         }
+
+        std::process::exit(0);
+    }
+
+    let script_path = match runtime_args.script_path {
+        Some(path) => path,
+        None => emit_json_error_and_exit(
+            "Usage: ironclad-runtime <script_path> [--packages name1,name2] | --verify <script_path>".to_string(),
+        ),
     };
 
     // Verify the script file exists before proceeding
@@ -258,6 +337,89 @@ fn main() -> wasmtime::Result<()> {
     };
     log::info!("Script SHA-256: {}", script_hash);
 
+    // Resolve package requirements before sandbox startup.
+    let script_packages =
+        match extract_package_requests_from_script(std::path::Path::new(&script_path)) {
+            Ok(requests) => requests,
+            Err(error) => {
+                let output = ExecutionOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 1,
+                    error: Some(format!("Failed to inspect package requirements: {}", error)),
+                };
+                log::error!("{}", serde_json::to_string(&output).unwrap());
+                std::process::exit(1);
+            }
+        };
+
+    if let Ok(Some(rejection)) =
+        detect_forbidden_install_attempt(std::path::Path::new(&script_path))
+    {
+        let output = ExecutionOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 1,
+            error: Some(
+                serde_json::json!({
+                    "status": "execution_rejected",
+                    "reason": rejection.reason.clone(),
+                    "packages_rejected": [rejection.clone()],
+                })
+                .to_string(),
+            ),
+        };
+        log::error!("{}", serde_json::to_string(&output).unwrap());
+        std::process::exit(1);
+    }
+
+    let requested_packages = merge_package_requests(runtime_args.cli_packages, script_packages);
+    let package_config = PackageResolutionConfig::default_local();
+    let package_summary = match resolve_packages(&requested_packages, &package_config) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let output = ExecutionOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 1,
+                error: Some(format!("Package resolution failed: {}", error)),
+            };
+            log::error!("{}", serde_json::to_string(&output).unwrap());
+            std::process::exit(1);
+        }
+    };
+
+    let pythonpath = build_pythonpath(&package_summary.approved, &package_config.mount_path);
+
+    let package_resolution_json = Some(manifest_summary(&package_summary));
+    if !package_summary.rejected.is_empty() {
+        let error_json = build_package_error_json(&package_summary);
+        if let Err(error) = audit::append_audit_entry(
+            audit::SANDBOX_RESULT,
+            serde_json::json!({
+                "script_hash": script_hash,
+                "exit_code": 1,
+                "runtime_ms": 0,
+                "error": "package_rejection",
+                "package_resolution": package_resolution_json,
+                "output": error_json,
+            }),
+        ) {
+            log::warn!(
+                "Failed to append audit entry for package rejection: {}",
+                error
+            );
+        }
+
+        let output = ExecutionOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 1,
+            error: Some(error_json),
+        };
+        log::error!("{}", serde_json::to_string(&output).unwrap());
+        std::process::exit(1);
+    }
 
     // ========================================================================
     // Prepare Sandbox & WASM Environment
@@ -265,6 +427,7 @@ fn main() -> wasmtime::Result<()> {
 
     // Create sandbox directory on host (guest will access via /sandbox)
     std::fs::create_dir_all(".sandbox")?;
+    std::fs::create_dir_all(&package_config.vault_dir)?;
 
     // Copy the input script into the sandbox so WASM can read it
     let host_script_in_sandbox = ".sandbox/script.py";
@@ -284,7 +447,10 @@ fn main() -> wasmtime::Result<()> {
             log::info!("Wasmtime compilation cache enabled");
         }
         Err(error) => {
-            log::warn!("Wasmtime cache unavailable, continuing without cache: {}", error);
+            log::warn!(
+                "Wasmtime cache unavailable, continuing without cache: {}",
+                error
+            );
         }
     }
 
@@ -312,6 +478,15 @@ fn main() -> wasmtime::Result<()> {
         DirPerms::all(),  // All directory permissions
         FilePerms::all(), // All file permissions
     )?;
+
+    // Package vault is mounted read-only at the Python site-packages path.
+    wasi_builder.preopened_dir(
+        package_config.vault_dir.as_path(),
+        package_config.mount_path.as_str(),
+        DirPerms::all(),
+        FilePerms::all(),
+    )?;
+    wasi_builder.env("PYTHONPATH", &pythonpath);
 
     // ❌ Network is NOT granted: no socket permissions in WASI context
     // Attempting urllib.request.urlopen(...) will fail with permission error
@@ -382,16 +557,16 @@ fn main() -> wasmtime::Result<()> {
     // Build and append the audit log entry
     // ========================================================================
 
-    // Build the record from the execution data we already have.
-    let audit_entry = &AuditEntry {
-        script_hash: script_hash.clone(),
-        timestamp_iso8601: time::OffsetDateTime::now_utc().to_string(),
-        duration_ms: exec_duration_ms,
-        exit_code: 0,
-        output_preview: String::new(),
-    };
-
-    audit::append_audit_entry(&audit_entry)?;
+    audit::append_audit_entry(
+        audit::SANDBOX_RESULT,
+        serde_json::json!({
+            "script_hash": script_hash,
+            "exit_code": 0,
+            "runtime_ms": exec_duration_ms,
+            "package_resolution": package_resolution_json,
+            "entrypoint": used_entrypoint,
+        }),
+    )?;
 
     log::info!("Audit entry appended to audit.log");
 

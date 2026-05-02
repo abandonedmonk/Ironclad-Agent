@@ -5,6 +5,7 @@ use rig::providers::cohere;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 
@@ -52,6 +53,19 @@ fn build_system_prompt() -> String {
     Use it ONLY for computation or verification.
     When you use execute_code, write a complete Python script, not a fragment.
     The script should be valid on its own and may assign intermediate variables.
+    If the script needs third-party packages, add a comment line with the PyPI distribution names,
+    not the import names. Examples:
+    - import yaml -> REQUIRES: pyyaml
+    - import dateutil -> REQUIRES: python-dateutil
+    - import PIL -> REQUIRES: pillow
+    - import bs4 -> REQUIRES: beautifulsoup4
+    The runtime will resolve those packages before execution.
+    Never call pip, uv, poetry, subprocess, or any installer inside the Python script.
+    Never attempt to install packages at runtime. If a package is needed, declare it in # REQUIRES:
+    using the PyPI distribution name and let the host resolver handle it.
+    If a package is rejected, treat the observation as structured JSON and replan.
+    After any error, your next response must still use the exact Thought / Action / ActionInput format.
+    Do not respond with prose only.
 
     Output format:
     Thought: <your reasoning>
@@ -68,6 +82,199 @@ fn build_system_prompt() -> String {
     .to_string()
 }
 
+fn extract_package_hints(code: &str) -> Vec<String> {
+    code.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let requires = trimmed
+                .strip_prefix("# REQUIRES:")
+                .or_else(|| trimmed.strip_prefix("REQUIRES:"));
+            requires.map(|value| value.trim().to_string())
+        })
+        .flat_map(|value| split_requires_packages(&value))
+        .collect()
+}
+
+fn split_requires_packages(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|segment| segment.trim())
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_string())
+        .collect()
+}
+
+fn normalize_requires_comment(code: &str) -> (String, Vec<String>) {
+    let mut packages = Vec::new();
+    let mut cleaned_lines = Vec::new();
+
+    for line in code.lines() {
+        if let Some(pos) = line.find("# REQUIRES:") {
+            let rest = &line[pos + "# REQUIRES:".len()..];
+            packages.extend(split_requires_packages(rest));
+
+            // If the REQUIRES comment was inline, keep the first part of the line
+            let before = &line[..pos];
+            if !before.trim().is_empty() {
+                cleaned_lines.push(before.trim_end());
+            }
+            continue;
+        }
+
+        if let Some(pos) = line.find("REQUIRES:") {
+            let rest = &line[pos + "REQUIRES:".len()..];
+            packages.extend(split_requires_packages(rest));
+
+            let before = &line[..pos];
+            if !before.trim().is_empty() {
+                cleaned_lines.push(before.trim_end());
+            }
+            continue;
+        }
+
+        cleaned_lines.push(line);
+    }
+
+    if packages.is_empty() {
+        return (code.to_string(), Vec::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for package in packages {
+        if seen.insert(package.clone()) {
+            deduped.push(package);
+        }
+    }
+
+    let mut normalized = String::new();
+    normalized.push_str("# REQUIRES: ");
+    normalized.push_str(&deduped.join(", "));
+    normalized.push('\n');
+    normalized.push_str(&cleaned_lines.join("\n"));
+
+    (normalized, deduped)
+}
+
+fn normalize_runtime_observation(stdout: &str, stderr: &str, success: bool) -> String {
+    if success {
+        return stdout.to_string();
+    }
+
+    let stderr_trim = stderr.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(stderr_trim) {
+        if value
+            .get("error")
+            .and_then(|error| error.as_str())
+            .is_some()
+        {
+            return stderr_trim.to_string();
+        }
+
+        if value.get("status").is_some() {
+            return value.to_string();
+        }
+    }
+
+    if stderr_trim.is_empty() {
+        let stdout_trim = stdout.trim();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout_trim) {
+            if value
+                .get("error")
+                .and_then(|error| error.as_str())
+                .is_some()
+            {
+                return stdout_trim.to_string();
+            }
+
+            if value.get("status").is_some() {
+                return value.to_string();
+            }
+        }
+
+        if !stdout_trim.is_empty() {
+            return stdout_trim.to_string();
+        }
+    }
+
+    stderr.to_string()
+}
+
+fn parse_observation_json(observation: &str) -> Option<serde_json::Value> {
+    let trimmed = observation.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+
+    let start = trimmed.find('{')?;
+    let candidate = &trimmed[start..];
+    serde_json::from_str::<serde_json::Value>(candidate).ok()
+}
+
+fn extract_execution_rejection(observation: &str) -> Option<serde_json::Value> {
+    let outer = parse_observation_json(observation)?;
+    if outer
+        .get("status")
+        .and_then(|value| value.as_str())
+        .is_some_and(|status| status == "execution_rejected")
+    {
+        return Some(outer);
+    }
+
+    let error_json = outer.get("error").and_then(|value| value.as_str())?;
+    let inner = serde_json::from_str::<serde_json::Value>(error_json).ok()?;
+    if inner
+        .get("status")
+        .and_then(|value| value.as_str())
+        .is_some_and(|status| status == "execution_rejected")
+    {
+        return Some(inner);
+    }
+
+    None
+}
+
+fn format_rejection_summary(rejection: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+    if let Some(rejected) = rejection
+        .get("packages_rejected")
+        .and_then(|value| value.as_array())
+    {
+        for entry in rejected {
+            let package = entry
+                .get("package")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let details = entry
+                .get("details")
+                .and_then(|value| value.as_str())
+                .unwrap_or("rejected");
+            lines.push(format!("Package '{}' rejected: {}", package, details));
+
+            if let Some(alternatives) = entry.get("alternatives").and_then(|value| value.as_array())
+            {
+                let choices: Vec<&str> = alternatives
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect();
+                if !choices.is_empty() {
+                    lines.push(format!("Alternatives: {}", choices.join(", ")));
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        let reason = rejection
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("execution_rejected");
+        lines.push(format!("Execution rejected: {}", reason));
+    }
+
+    lines.join("\n")
+}
+
 // Perform one reasoning step with a single composed prompt.
 // This avoids provider-specific multi-message payload incompatibilities.
 async fn reason_once(
@@ -82,6 +289,9 @@ async fn reason_once(
     }
 
     let response = agent.prompt(prompt).await?;
+    if std::env::var("NOS_DEBUG").is_ok() {
+        println!("\n[DEBUG] Raw LLM response:\n{}\n---", response);
+    }
     parse_agent_response(&response)
 }
 
@@ -111,14 +321,18 @@ fn parse_agent_response(text: &str) -> Result<AgentTurn> {
         }
 
         // If model chose execute_code but omitted ActionInput, fall back to finish if present.
-        if let Ok(answer) = extract_section(text, "FinalAnswer").or_else(|_| extract_section(text, "Final Answer")) {
+        if let Ok(answer) =
+            extract_section(text, "FinalAnswer").or_else(|_| extract_section(text, "Final Answer"))
+        {
             return Ok(AgentTurn {
                 thought,
                 action: AgentAction::Finish { answer },
             });
         }
 
-        return Err(anyhow::anyhow!("Could not parse ActionInput/Code for execute_code action"));
+        return Err(anyhow::anyhow!(
+            "Could not parse ActionInput/Code for execute_code action"
+        ));
     }
     Err(anyhow::anyhow!("Could not parse action"))
 }
@@ -159,11 +373,59 @@ fn extract_code_input(text: &str) -> Result<String> {
     }
 
     // 3) Fallback: explicit Code: <python code>
-    if let Ok(code_line) = extract_section(text, "Code") {
-        return Ok(code_line);
+    if let Some(idx) = text.find("Code:") {
+        let after = &text[idx + "Code:".len()..].trim_start();
+        // If there's an Observation or FinalAnswer block after, clip it.
+        let end_idx = after.find("Observation:").unwrap_or(after.len());
+        let end_idx = after[..end_idx].find("FinalAnswer:").unwrap_or(end_idx);
+        let end_idx = after[..end_idx].find("Final Answer:").unwrap_or(end_idx);
+        let code = after[..end_idx].trim().to_string();
+        if !code.is_empty() {
+            return Ok(code);
+        }
+    }
+
+    // 4) Fallback: code inside markdown fenced block (```python ... ``` or ```bash ... ```)
+    if let Some(fence_start) = text.find("```") {
+        let after_fence = &text[fence_start + 3..];
+        // Skip the language tag line (e.g., "python\n" or "bash\n")
+        if let Some(newline) = after_fence.find('\n') {
+            let code_start = &after_fence[newline + 1..];
+            if let Some(fence_end) = code_start.find("```") {
+                let code = code_start[..fence_end].trim().to_string();
+                if !code.is_empty() {
+                    return Ok(code);
+                }
+            }
+        }
     }
 
     Err(anyhow::anyhow!("Could not extract code input"))
+}
+
+/// Extracts the manifest header fields from a diagnostic bash script.
+/// Returns (fs_requires, purpose, timestamp).
+fn parse_script_manifest(code: &str) -> (Vec<String>, String, String) {
+    let mut requires = Vec::new();
+    let mut purpose = String::new();
+    let mut timestamp = String::new();
+
+    for line in code.lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("# REQUIRES:") {
+            // Only collect fs: entries (not Python PyPI packages)
+            requires.extend(
+                v.split(',')
+                 .map(|s| s.trim().to_string())
+                 .filter(|s| s.starts_with("fs:"))
+            );
+        } else if let Some(v) = t.strip_prefix("# PURPOSE:") {
+            purpose = v.trim().to_string();
+        } else if let Some(v) = t.strip_prefix("# TIMESTAMP:") {
+            timestamp = v.trim().to_string();
+        }
+    }
+    (requires, purpose, timestamp)
 }
 
 // Extract a labeled section from response text. Pattern: "Label: value"
@@ -231,8 +493,15 @@ impl Tool for ExecuteCodeTool {
         // Write Python code to temp file.
         let mut file = fs::File::create(&temp_path)
             .map_err(|e| ToolError(format!("Failed to create temp file: {}", e)))?;
-        file.write_all(args.code.as_bytes())
+        let (normalized_code, normalized_requires) = normalize_requires_comment(&args.code);
+        file.write_all(normalized_code.as_bytes())
             .map_err(|e| ToolError(format!("Failed to write code: {}", e)))?;
+
+        let package_hints = if normalized_requires.is_empty() {
+            extract_package_hints(&normalized_code)
+        } else {
+            normalized_requires
+        };
 
         // Execute ironclad-runtime with the temp script.
         // Prefer the workspace binary target path, then fall back to a local executable name.
@@ -251,8 +520,14 @@ impl Tool for ExecuteCodeTool {
             std::path::Path::new("ironclad-runtime")
         };
 
-        let output = Command::new(command)
-            .arg(&temp_path)
+        let mut command_line = Command::new(command);
+        if !package_hints.is_empty() {
+            command_line.arg("--packages");
+            command_line.arg(package_hints.join(","));
+        }
+        command_line.arg(&temp_path);
+
+        let output = command_line
             .output()
             .map_err(|e| ToolError(format!("Failed to execute sandbox: {}", e)))?;
 
@@ -261,10 +536,10 @@ impl Tool for ExecuteCodeTool {
 
         // Return error if execution failed.
         if !output.status.success() {
-            return Ok(format!("Error:\n{}", stderr));
+            return Ok(normalize_runtime_observation(&stdout, &stderr, false));
         }
 
-        Ok(stdout.to_string())
+        Ok(normalize_runtime_observation(&stdout, &stderr, true))
     }
 }
 
@@ -293,15 +568,27 @@ async fn main() -> Result<()> {
     // Scratchpad stores text-only turn summaries used to build the next prompt.
     let mut scratchpad: Vec<String> = Vec::new();
     let mut steps = 0;
-    const MAX_STEPS: usize = 5;
+    const MAX_STEPS: usize = 30;
 
     // ReAct loop: iterate until agent finishes or max steps reached.
     loop {
         steps += 1;
         println!("\n--- Step {} ---", steps);
 
+        // Dot printer while LLM is thinking
+        let dot_handle = tokio::spawn(async {
+            loop {
+                print!(".");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+        let turn_result = reason_once(&agent, &user_task, &scratchpad).await;
+        dot_handle.abort();
+        println!(); // newline after dots
+
         // Get next reasoning turn from LLM.
-        match reason_once(&agent, &user_task, &scratchpad).await {
+        match turn_result {
             Ok(turn) => {
                 println!("Thought: {}", turn.thought);
 
@@ -312,15 +599,49 @@ async fn main() -> Result<()> {
                         println!("Code: {}", code);
 
                         // Call tool (runs ironclad-runtime subprocess).
+                        // Clone code before moving into CodeArgs so it remains available
+                        // for scratchpad recording after the call consumes args.
                         let tool = ExecuteCodeTool;
+                        let code_snapshot = code.clone();
                         let args = CodeArgs { code };
                         let result = Tool::call(&tool, args)
                             .await
                             .map_err(|e| anyhow::anyhow!("Tool call failed: {}", e))?;
                         println!("Observation: {}", result);
 
+                        // On a structured package rejection, push it to the scratchpad
+                        // so the model can replan (not hard-exit). Hard-exit only when
+                        // the model has already seen the rejection and still can't fix it
+                        // (detected by checking if the same rejection is already in scratchpad).
+                        if let Some(rejection) = extract_execution_rejection(&result) {
+                            let rejection_summary = format_rejection_summary(&rejection);
+                            let already_seen = scratchpad
+                                .iter()
+                                .any(|entry| entry.contains(&rejection_summary));
+                            if already_seen {
+                                // Model already tried and failed to replan; surface and exit.
+                                println!("Final Answer: {}", rejection_summary);
+                                return Ok(());
+                            }
+                            // First occurrence: let the model replan.
+                            scratchpad.push(format!(
+                                "Thought: {}\nAction: execute_code\nCode:\n{}",
+                                turn.thought, code_snapshot
+                            ));
+                            scratchpad.push(format!(
+                                "Observation: Package rejected — {}. Rewrite without these packages.",
+                                rejection_summary
+                            ));
+                            continue;
+                        }
+
                         // Add this turn to scratchpad for the next reasoning step.
-                        scratchpad.push(format!("Thought: {}\nAction: execute_code", turn.thought));
+                        // Include the code so the model can see which # REQUIRES: it used
+                        // and carry them forward correctly on retry.
+                        scratchpad.push(format!(
+                            "Thought: {}\nAction: execute_code\nCode:\n{}",
+                            turn.thought, code_snapshot
+                        ));
                         scratchpad.push(format!("Observation: {}", result));
                     }
                     AgentAction::Finish { answer } => {

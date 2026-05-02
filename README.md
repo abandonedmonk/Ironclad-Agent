@@ -63,6 +63,9 @@ cargo run -p ironclad-agent -- "Calculate: 5 + 3 * 2"
 
 # Give it a task, e.g., "Calculate the 10th Fibonacci number"
 # Watch it generate code, execute it safely, and return the result
+
+# Option 3: Agent demo with external packages (no network calls)
+cargo run --release -p ironclad-agent -- "Write Python that uses python-dateutil and six to parse '2022-01-01' and print it. Use REQUIRES comments only."
 ```
 
 ---
@@ -243,7 +246,18 @@ cargo run -p ironclad-agent -- "Find all prime numbers less than 100"
 # 5. Return answer with audit proof
 ```
 
-### Example 3: Detect Security Violations
+### Example 3: Requesting Packages (Pure-Python Wheels Only)
+
+```python
+# REQUIRES: python-dateutil, six
+from dateutil.parser import parse
+
+print(parse("2022-01-01").strftime("%Y-%m-%d"))
+```
+
+The runtime resolves package hints before execution, mounts approved pure-Python wheels into the sandbox, and returns structured JSON if a package is rejected. Native-extension packages such as `numpy` are blocked and reported with alternatives. Packages like `pyyaml` are rejected because they only publish platform-specific or source distributions.
+
+### Example 4: Detect Security Violations
 
 ```python
 script = Path(".sandbox/escape.py")
@@ -267,7 +281,95 @@ print(proc.stderr)  # "os.system: Permission denied"
 
 ---
 
-## 🛠️ Development
+## � Demo Commands
+
+Ready-to-run examples on Windows PowerShell. Build the runtime first with `cargo build --release`.
+
+### Demo 1: Date Parsing with External Libraries
+
+```bash
+cargo run -p ironclad-runtime -- --packages python-dateutil test.py
+```
+
+Test script `test.py`:
+
+```python
+from dateutil.parser import parse
+# REQUIRES: python-dateutil, six
+print(parse("2022-01-01").strftime("%Y-%m-%d"))
+```
+
+Via AI Agent (ReAct loop):
+
+```bash
+cargo run --release -p ironclad-agent -- "Write Python that uses python-dateutil and six to parse '2022-01-01' and print it. Use REQUIRES comments only."
+```
+
+### Demo 2: Requests Library (No Network Calls)
+
+```bash
+cargo run -p ironclad-runtime -- --packages requests test.py
+```
+
+Test script `test.py`:
+
+```python
+import requests
+import click
+# REQUIRES: requests, urllib3, idna, certifi, charset-normalizer, click
+
+@click.command()
+def main():
+    click.echo(requests.__version__)
+
+if __name__ == "__main__":
+    main()
+```
+
+Via AI Agent:
+
+```bash
+cargo run --release -p ironclad-agent -- "Write Python that uses requests and click to print requests.__version__. Do not make network calls. Use REQUIRES comments only."
+```
+
+### Demo 3: CSV Summarizer (Stdlib Only)
+
+```bash
+cargo run -p ironclad-runtime -- test.py
+```
+
+Test script `test.py`:
+
+```python
+import csv
+from collections import Counter
+
+rows = list(csv.DictReader(open("data.csv", newline="", encoding="utf-8")))
+counts = Counter(row["status"] for row in rows)
+print(f"Status summary: {dict(counts)}")
+```
+
+Data file `data.csv`:
+
+```
+status
+ok
+ok
+fail
+fail
+fail
+```
+
+### Verify Execution Audit Log
+
+```bash
+# View all executions (parse audit.log as JSON)
+cargo run -p ironclad-runtime -- --verify <script_hash> test.py
+```
+
+---
+
+## �🛠️ Development
 
 ### Project Structure
 
