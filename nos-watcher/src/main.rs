@@ -23,11 +23,12 @@ fn audit_path() -> PathBuf {
 }
 
 fn agent_bin() -> PathBuf {
-    let release = PathBuf::from("target/release/ironclad-agent");
+    let exe_suffix = std::env::consts::EXE_SUFFIX;
+    let release = PathBuf::from(format!("target/release/ironclad-agent{}", exe_suffix));
     if release.exists() {
         return release;
     }
-    PathBuf::from("target/debug/ironclad-agent")
+    PathBuf::from(format!("target/debug/ironclad-agent{}", exe_suffix))
 }
 
 // ── Audit (hash-chained JSONL) ────────────────────────────────────────────────

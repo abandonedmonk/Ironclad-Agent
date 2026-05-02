@@ -78,6 +78,12 @@ fn build_system_prompt() -> String {
     FinalAnswer: <your answer>
 
     If code errors, analyze and retry ONCE.
+
+    ### SANDBOX CONSTRAINTS (WASM/WASI) ###
+    - No C-extensions: Packages like psutil, numpy, or pandas will fail. Use only pure-Python libraries or the standard library.
+    - No direct OS process APIs: os.getloadavg() and similar functions are not implemented in WASI.
+    - Diagnostic Strategy: To read system metrics (CPU, Memory, Load), you MUST read from /proc files directly using open(). 
+      Example: open('/proc/loadavg').read() or open('/proc/meminfo').read().
     "#
     .to_string()
 }
@@ -195,6 +201,22 @@ fn normalize_runtime_observation(stdout: &str, stderr: &str, success: bool) -> S
         if !stdout_trim.is_empty() {
             return stdout_trim.to_string();
         }
+    }
+
+    // Auto-catch ModuleNotFoundError and return JIT-compliant structured error
+    if stderr.contains("ModuleNotFoundError") {
+        let package = stderr.split("ModuleNotFoundError: No module named '")
+            .nth(1)
+            .and_then(|s| s.split("'").next())
+            .unwrap_or("unknown");
+        
+        return serde_json::json!({
+            "status": "execution_rejected",
+            "reason": "missing_requires_declaration",
+            "package": package,
+            "details": "The sandbox requires explicit declaration of third-party packages. Note that C-extensions (psutil, numpy) are NOT supported in WASM.",
+            "alternatives": ["Read /proc files directly using standard library open()"]
+        }).to_string();
     }
 
     stderr.to_string()
@@ -652,8 +674,15 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                // Parsing error; continue or fail if max steps reached.
-                println!("Parse error: {}", e);
+                // Parsing error; inject feedback into scratchpad so model can retry.
+                let error_msg = format!(
+                    "Observation: System Error: Could not parse your response ({}). \
+                    Please ensure you use the exact 'Thought / Action / ActionInput' format. \
+                    Wrap code in a ```python fenced block.",
+                    e
+                );
+                println!("{}", error_msg);
+                scratchpad.push(error_msg);
                 if steps >= MAX_STEPS {
                     return Err(e);
                 }
