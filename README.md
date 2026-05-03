@@ -1,4 +1,4 @@
-# 🔒 Ironclad Agent
+# Ironclad Agent
 
 > **A zero-trust WebAssembly runtime for autonomous AI agents** — where every line of LLM-generated code runs in a cryptographically audited sandbox, never on your host machine.
 
@@ -9,21 +9,22 @@
 
 ---
 
-## 🎯 What Is This?
+## What Is This?
 
 An AI code-execution agent that **physically cannot escape its sandbox**. The LLM generates Python scripts. Those scripts run inside a WebAssembly jail with:
 
-- ✅ **No network access** — outbound calls blocked at runtime
-- ✅ **No filesystem escape** — reads/writes confined to `/sandbox`
-- ✅ **CPU budgeted** — infinite loops killed in milliseconds
-- ✅ **Tamper-proof audit log** — SHA-256 hashed execution provenance
-- ✅ **4.26x faster than Docker** — thanks to Wasmtime caching
+- **No network access** — outbound calls blocked at runtime
+- **No filesystem escape** — reads/writes confined to `/sandbox`
+- **CPU budgeted** — infinite loops killed in milliseconds
+- **Tamper-proof audit log** — SHA-256 hashed execution provenance
+- **4.26x faster than Docker** — thanks to Wasmtime caching
+- **Autonomous monitoring** — eBPF anomaly detection triggers agent diagnosis without human input
 
-**The demo:** Ask the agent to solve a task. It writes code, runs it, returns the result. Show the audit log proving what executed. Explain that the code physically could not touch the network or filesystem. That's the pitch that gets you hired.
+**The demo:** An eBPF probe detects anomalous system behavior. A watcher hands the alert to an LLM agent. The agent writes diagnostic Python, runs it in the WASM sandbox, and returns findings with a tamper-proof audit log — all without human intervention. That's the pitch that gets you hired.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -55,39 +56,50 @@ pip install -r requirements.txt
 # Option 1: Run a simple test script
 ./target/release/ironclad-runtime tests/smoke/scripts/hello.py
 
-# Option 2: Start the AI agent
-cargo run -p ironclad-agent -- "Calculate: 5 + 3 * 2"
+# Option 2: Start the AI agent with a task
+./target/release/ironclad-agent "Calculate the 10th Fibonacci number"
 
-# If you built release binaries already, you can also run:
-# ./target/release/ironclad-agent "Calculate: 5 + 3 * 2"
+# Option 3: Full autonomous pipeline (anomaly detection -> agent -> sandbox)
+make demo
 
-# Give it a task, e.g., "Calculate the 10th Fibonacci number"
-# Watch it generate code, execute it safely, and return the result
-
-# Option 3: Agent demo with external packages (no network calls)
-cargo run --release -p ironclad-agent -- "Write Python that uses python-dateutil and six to parse '2022-01-01' and print it. Use REQUIRES comments only."
+# Stop the pipeline
+make demo-stop
 ```
+
+### One-Command Demo Pipeline
+
+```bash
+make demo
+```
+
+This starts the full autonomous loop:
+
+1. **Anomaly detector** (`monitor/detect.py`) — eBPF telemetry + Isolation Forest, writes alert on anomaly
+2. **nos-watcher** — polls for alerts, invokes the AI agent
+3. **ironclad-agent** — LLM generates pure-Python diagnostic code
+4. **ironclad-runtime** — executes the code in a WASM sandbox
+
+Logs stream to the console. Stop with `Ctrl+C` or `make demo-stop`.
 
 ---
 
-## 📊 Performance Benchmarks
+## Performance Benchmarks
 
 The **4.26x speedup over Docker** comes from eliminating redundant JIT compilation via Wasmtime's integrated cache.
 
 ```text
 Scenario: Execute Python 3.12 interpreter 100 times
 
-│ Runtime         │ Median   │ P95       │ P99       │ Min      │
-├─────────────────┼──────────┼───────────┼───────────┼──────────┤
-│ Docker (alpine) │ 778 ms   │ 791 ms    │ 805 ms    │ 765 ms   │
-│ Ironclad w/ cache│ 182 ms   │ 199 ms    │ 206 ms    │ 167 ms   │
-│ **Speedup**     │ **4.26x**│ **3.97x** │ **3.91x** │ **4.58x**│
-└─────────────────┴──────────┴───────────┴───────────┴──────────┘
+| Runtime          | Median   | P95       | P99       | Min      |
+|------------------|----------|-----------|-----------|----------|
+| Docker (alpine)  | 778 ms   | 791 ms    | 805 ms    | 765 ms   |
+| Ironclad w/ cache| 182 ms   | 199 ms    | 206 ms    | 167 ms   |
+| **Speedup**      | **4.26x**| **3.97x** | **3.91x** | **4.58x**|
 
 Memory overhead per execution:
-  • Docker container:      50–100 MB
-  • Ironclad instance:     5–10 MB
-  • Savings:              ~90%
+  Docker container:      50-100 MB
+  Ironclad instance:     5-10 MB
+  Savings:              ~90%
 ```
 
 **What changed to achieve this:** See [WASM Caching Internals](docs/8_WASM_CACHING_INTERNALS.md) for the technical deep-dive on why caching was critical.
@@ -103,75 +115,105 @@ python tests/benchmarks/run_benchmark.py --iterations 100 --warmup 5
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ### System Design
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                  AI Agent Layer (Python)                   │
-│                                                            │
-│  User Task → LangGraph (ReAct) → execute_secure_code()    │
-└────────────────────┬──────────────────────────────────────┘
-                     │ subprocess call
-                     ▼
-┌────────────────────────────────────────────────────────────┐
-│              Ironclad Runtime Layer (Rust)                 │
-│                                                            │
-│  1. Hash script (SHA-256)                                 │
-│  2. Load WASM module (cached via Wasmtime)                │
-│  3. Configure sandbox:                                    │
-│     • Filesystem: only /sandbox read/write               │
-│     • Network: blocked                                   │
-│     • Fuel budget: CPU instruction limit                 │
-│  4. Execute Python interpreter (in WASM)                 │
-│  5. Log execution: hash + timestamp → audit.log          │
-│  6. Return stdout/stderr                                 │
-└────────────────────────────────────────────────────────────┘
-                     ▲
-        Wasmtime Engine (JIT compiled code cache)
-        [Cached compilation = 15ms per run]
++---------------------------------------------------------------+
+|                  Monitoring Layer (Python)                     |
+|                                                                |
+|  eBPF probes (execve, tcp) -> Isolation Forest -> anomaly alert|
++----------------------------+-----------------------------------+
+                             | writes scratch_repo/nos_alert.json
+                             v
++---------------------------------------------------------------+
+|                  Watcher Layer (Rust)                          |
+|                                                                |
+|  nos-watcher polls for alerts -> invokes ironclad-agent        |
++----------------------------+-----------------------------------+
+                             | spawns agent process
+                             v
++---------------------------------------------------------------+
+|                  AI Agent Layer (Rust + Cohere)                |
+|                                                                |
+|  User Task / Alert -> ReAct loop -> generate Python code       |
++----------------------------+-----------------------------------+
+                             | subprocess call
+                             v
++---------------------------------------------------------------+
+|              Ironclad Runtime Layer (Rust/WASM)                |
+|                                                                |
+|  1. Hash script (SHA-256)                                     |
+|  2. Load WASM module (cached via Wasmtime)                    |
+|  3. Configure sandbox:                                        |
+|     - Filesystem: /sandbox read/write, /proc read-only        |
+|     - Network: blocked                                        |
+|     - Fuel budget: CPU instruction limit                      |
+|  4. Execute Python interpreter (in WASM)                      |
+|  5. Log execution: hash + timestamp -> nos_audit.jsonl        |
+|  6. Return stdout/stderr                                      |
++---------------------------------------------------------------+
+                             ^
+         Wasmtime Engine (JIT compiled code cache)
+         [Cached compilation = 15ms per run]
 ```
 
 ### Key Components
 
 | Component            | Purpose                                    | Language                |
-| -------------------- | ------------------------------------------ | ----------------------- |
+|----------------------|--------------------------------------------|-------------------------|
 | **ironclad-runtime** | Sandbox engine; compiles/runs WASM modules | Rust                    |
-| **agent/**           | ReAct reasoning loop + code generation     | Python (LangGraph)      |
+| **ironclad-agent**   | ReAct reasoning loop + code generation     | Rust (Cohere LLM)       |
+| **nos-watcher**      | Polls for anomaly alerts, invokes agent    | Rust                    |
+| **monitor/**         | eBPF telemetry + anomaly detection         | Python (scikit-learn)   |
 | **python.wasm**      | Python 3.12 compiled to WASM               | WASM (from VMware Labs) |
-| **Audit Log**        | Tamper-proof execution history             | JSON + SHA-256          |
+| **Audit Log**        | Hash-chained execution history             | JSONL + SHA-256         |
+
+### Pipeline Flow
+
+```
+detect.py (anomaly detected)
+  -> writes scratch_repo/nos_alert.json
+    -> nos-watcher (polls every 2s)
+      -> invokes ironclad-agent
+        -> LLM generates pure-Python diagnostic script
+          -> ironclad-runtime (WASM sandbox)
+            -> script reads /proc/ files (read-only)
+            -> returns results + audit log entry
+```
 
 ---
 
-## 🔐 Security Model
+## Security Model
 
 ### What's Guaranteed
 
 ```
-┌─────────────────────────────────────────────────────┐
-│          Threat Model & Mitigations                 │
-├─────────────────────────────────────────────────────┤
-│ Threat: Out-of-bounds memory access                │
-│ → Blocked by: WASM memory bounds checks             │
-│ → Verified at compile time (Cranelift)            │
-│                                                    │
-│ Threat: Network escape                             │
-│ → Blocked by: WASI context (no socket capability) │
-│ → Enforced at runtime                             │
-│                                                    │
-│ Threat: Infinite loop (DoS)                        │
-│ → Blocked by: Fuel-based instruction metering      │
-│ → Kills at: 1M fuel units ≈ 100ms                │
-│                                                    │
-│ Threat: Filesystem escape                          │
-│ → Blocked by: chroot-like /sandbox isolation       │
-│ → Enforced at file syscall boundary               │
-│                                                    │
-│ Threat: Execution tampering                        │
-│ → Prevented by: SHA-256 audit log + timestamps     │
-│ → Verifiable offline                              │
-└─────────────────────────────────────────────────────┘
++-----------------------------------------------------+
+|          Threat Model & Mitigations                  |
++-----------------------------------------------------+
+| Threat: Out-of-bounds memory access                 |
+| -> Blocked by: WASM memory bounds checks            |
+| -> Verified at compile time (Cranelift)             |
+|                                                      |
+| Threat: Network escape                              |
+| -> Blocked by: WASI context (no socket capability)  |
+| -> Enforced at runtime                              |
+|                                                      |
+| Threat: Infinite loop (DoS)                         |
+| -> Blocked by: Fuel-based instruction metering      |
+| -> Kills at: 1M fuel units = ~100ms                |
+|                                                      |
+| Threat: Filesystem escape                           |
+| -> Blocked by: chroot-like /sandbox isolation       |
+| -> /proc/ mounted read-only for diagnostics         |
+| -> Enforced at file syscall boundary                |
+|                                                      |
+| Threat: Execution tampering                         |
+| -> Prevented by: SHA-256 audit log + timestamps    |
+| -> Verifiable offline                               |
++-----------------------------------------------------+
 ```
 
 ### Audit Log Verification
@@ -179,20 +221,19 @@ python tests/benchmarks/run_benchmark.py --iterations 100 --warmup 5
 Every execution produces an immutable record:
 
 ```bash
-# View audit log
-cat audit.log | jq '.[] | {script_hash, timestamp, exit_code}'
+# View the hash-chained audit trail
+cat scratch_repo/nos_audit.jsonl | python3 -m json.tool
 
 # Verify a specific execution
 ./target/release/ironclad-runtime --verify abc123def... script.py
-# Output: "✓ VERIFIED — hash matches audit log entry #42"
 ```
 
 ---
 
-## 📖 Documentation
+## Documentation
 
 | Document                                                        | Content                                    |
-| --------------------------------------------------------------- | ------------------------------------------ |
+|-----------------------------------------------------------------|--------------------------------------------|
 | [0_README.md](docs/0_README.md)                                 | Project overview and pitch                 |
 | [1_Roadmap.md](docs/1_Roadmap.md)                               | Build steps + learning prerequisites       |
 | [2_Tech_Stack.md](docs/2_Tech_Stack.md)                         | Every layer with tradeoff analysis         |
@@ -205,7 +246,7 @@ cat audit.log | jq '.[] | {script_hash, timestamp, exit_code}'
 
 ---
 
-## 💡 Usage Examples
+## Usage Examples
 
 ### Example 1: Simple Code Execution
 
@@ -213,14 +254,12 @@ cat audit.log | jq '.[] | {script_hash, timestamp, exit_code}'
 from pathlib import Path
 import subprocess
 
-# Write a Python script to the sandbox
 script = Path(".sandbox/calc.py")
 script.write_text("""
 result = sum(range(1, 101))
 print(f"Sum of 1-100: {result}")
 """)
 
-# Execute it securely
 proc = subprocess.run(
     ["./target/release/ironclad-runtime", str(script)],
     capture_output=True,
@@ -233,10 +272,7 @@ print(proc.stdout)  # "Sum of 1-100: 5050"
 ### Example 2: Using the AI Agent
 
 ```bash
-cargo run -p ironclad-agent -- "Find all prime numbers less than 100"
-
-# Agent prompt:
-# "Find all prime numbers less than 100"
+./target/release/ironclad-agent "Find all prime numbers less than 100"
 
 # Agent will:
 # 1. Think about how to solve this
@@ -266,7 +302,6 @@ import os
 os.system("cat /etc/passwd")
 """)
 
-# Run it
 proc = subprocess.run(
     ["./target/release/ironclad-runtime", str(script)],
     capture_output=True,
@@ -275,20 +310,63 @@ proc = subprocess.run(
 
 # Result: Permission denied (caught by WASI)
 print(proc.stderr)  # "os.system: Permission denied"
+```
 
-# Audit log shows the attempt was made but contained
+### Example 5: System Diagnostics via /proc/
+
+```python
+# /proc/ is mounted read-only inside the sandbox
+# No need for psutil or other C-extension packages
+with open("/proc/meminfo") as f:
+    for line in f:
+        if line.startswith("MemTotal") or line.startswith("MemAvailable"):
+            print(line.strip())
+
+with open("/proc/loadavg") as f:
+    print("Load average:", f.read().strip())
 ```
 
 ---
 
-## � Demo Commands
+## Demo Commands
 
-Ready-to-run examples on Windows PowerShell. Build the runtime first with `cargo build --release`.
+### Full Autonomous Pipeline
+
+```bash
+# Build + start the complete loop: eBPF anomaly -> watcher -> agent -> sandbox
+make demo
+
+# Stop all pipeline processes
+make demo-stop
+```
+
+### Individual Pipeline Components
+
+```bash
+# Anomaly detection only (writes alerts to scratch_repo/nos_alert.json)
+make demo-detect
+
+# Watcher only (polls for alerts, invokes agent)
+make demo-watch
+
+# Retrain the Isolation Forest model from monitor/data/
+make train
+```
+
+### Standalone Agent
+
+```bash
+# Direct agent invocation with a task
+./target/release/ironclad-agent "Calculate the 10th Fibonacci number"
+
+# Agent with external packages (pure-Python only)
+./target/release/ironclad-agent "Write Python that uses python-dateutil and six to parse '2022-01-01' and print it. Use REQUIRES comments only."
+```
 
 ### Demo 1: Date Parsing with External Libraries
 
 ```bash
-cargo run -p ironclad-runtime -- --packages python-dateutil test.py
+./target/release/ironclad-runtime --packages python-dateutil test.py
 ```
 
 Test script `test.py`:
@@ -299,16 +377,10 @@ from dateutil.parser import parse
 print(parse("2022-01-01").strftime("%Y-%m-%d"))
 ```
 
-Via AI Agent (ReAct loop):
-
-```bash
-cargo run --release -p ironclad-agent -- "Write Python that uses python-dateutil and six to parse '2022-01-01' and print it. Use REQUIRES comments only."
-```
-
 ### Demo 2: Requests Library (No Network Calls)
 
 ```bash
-cargo run -p ironclad-runtime -- --packages requests test.py
+./target/release/ironclad-runtime --packages requests test.py
 ```
 
 Test script `test.py`:
@@ -326,105 +398,132 @@ if __name__ == "__main__":
     main()
 ```
 
-Via AI Agent:
+### Demo 3: System Diagnostics via /proc/
 
 ```bash
-cargo run --release -p ironclad-agent -- "Write Python that uses requests and click to print requests.__version__. Do not make network calls. Use REQUIRES comments only."
-```
-
-### Demo 3: CSV Summarizer (Stdlib Only)
-
-```bash
-cargo run -p ironclad-runtime -- test.py
+./target/release/ironclad-runtime test.py
 ```
 
 Test script `test.py`:
 
 ```python
-import csv
-from collections import Counter
-
-rows = list(csv.DictReader(open("data.csv", newline="", encoding="utf-8")))
-counts = Counter(row["status"] for row in rows)
-print(f"Status summary: {dict(counts)}")
+with open("/proc/meminfo") as f:
+    for line in f:
+        if line.startswith("MemTotal") or line.startswith("MemAvailable"):
+            print(line.strip())
 ```
 
-Data file `data.csv`:
-
-```
-status
-ok
-ok
-fail
-fail
-fail
-```
+The `/proc/` filesystem is mounted read-only inside the sandbox, so diagnostic scripts can read system metrics without needing C-extension packages like `psutil`.
 
 ### Verify Execution Audit Log
 
 ```bash
-# View all executions (parse audit.log as JSON)
-cargo run -p ironclad-runtime -- --verify <script_hash> test.py
+# View the hash-chained audit trail
+cat scratch_repo/nos_audit.jsonl | python3 -m json.tool
+
+# Verify a specific execution hash
+./target/release/ironclad-runtime --verify <script_hash> test.py
 ```
 
 ---
 
-## �🛠️ Development
+## Development
 
 ### Project Structure
 
 ```
 ironclad-agent/
-├── agent/                  # Python agent code (LangGraph)
-│   ├── main.py            # Entry point
-│   └── Cargo.toml         # Rust workspace member
-├── src/                   # Rust runtime
-│   └── main.rs            # Wasmtime initialization + sandbox setup
-├── tests/                 # Test suite
-│   ├── smoke/             # Smoke tests
-│   └── benchmarks/        # Performance benchmarks
-├── docs/                  # Complete documentation
-├── python-3.12.0.wasm    # Python interpreter (prebuilt)
-├── Cargo.toml            # Rust workspace root
-├── pyproject.toml        # Python dependencies
-└── Makefile              # Convenience build commands
++-- agent/                  # AI agent (ReAct loop + code generation)
+|   +-- src/main.rs        # Cohere LLM integration, tool execution
+|   +-- Cargo.toml         # Rust workspace member
++-- nos-watcher/            # Alert polling + agent invocation
+|   +-- src/main.rs        # Polls scratch_repo/nos_alert.json
+|   +-- Cargo.toml         # Rust workspace member
++-- src/                    # Ironclad runtime (WASM sandbox engine)
+|   +-- main.rs            # Wasmtime initialization + sandbox setup
+|   +-- audit.rs           # Hash-chained audit log
+|   +-- crypto.rs          # SHA-256 hashing
+|   +-- packages.rs        # Pure-Python wheel resolver
+|   +-- verify.rs          # Audit log verification
++-- monitor/                # eBPF telemetry + anomaly detection
+|   +-- bpf/               # eBPF kernel probes
+|   |   +-- simple_telemetry.bpf.c   # BCC-compatible probe
+|   |   +-- telemetry.bpf.c          # libbpf-style probe
+|   +-- models/            # Pre-trained ML models
+|   |   +-- isolation_forest_model.pkl
+|   |   +-- scaler.pkl
+|   +-- data/              # Training data
+|   |   +-- telemetry_data.csv
+|   |   +-- data.txt
+|   +-- detect.py          # Live anomaly detection (writes alerts)
+|   +-- train.py           # Model training
+|   +-- telemetry.py       # Standalone eBPF telemetry viewer
++-- scratch_repo/           # Runtime handshake zone
+|   +-- nos_alert.json     # Alert written by detect.py
+|   +-- nos_audit.jsonl    # Hash-chained audit log
++-- display/                # Audit visualization
+|   +-- audit_display.sh
+|   +-- pipeline_display.py
++-- tests/                  # Test suite
+|   +-- smoke/             # Smoke tests
+|   +-- benchmarks/        # Performance benchmarks
++-- docs/                   # Complete documentation
++-- python-3.12.0.wasm     # Python interpreter (prebuilt)
++-- Cargo.toml             # Rust workspace root
++-- Makefile               # Build + demo commands
 ```
 
 ### Building from Source
 
 ```bash
-# Full build (Rust + Python)
+# Full build (all workspace binaries)
 make build
 
-# Just Rust runtime
+# Individual binaries
 cargo build --release -p ironclad-runtime
+cargo build --release -p ironclad-agent
+cargo build --release -p nos-watcher
 
-# Just run tests
-make test
-
-# Benchmarks only
-make bench
+# Run tests
+make smoke
 
 # Clean
 make clean
 ```
 
-### Enabling Features
+### Monitoring Setup
 
-The cache feature is already enabled in `Cargo.toml`. To rebuild without it:
+The anomaly detection pipeline uses eBPF and scikit-learn:
 
 ```bash
-cargo build --release --no-default-features
-# Note: Performance will be ~10x worse due to JIT recompilation
+# Install Python dependencies
+pip install scikit-learn joblib pandas psutil
+
+# Retrain the model (optional — pre-trained model included)
+make train
+
+# Run detection standalone (requires root for eBPF)
+sudo python3 monitor/detect.py
+
+# Run without root (skips BPF, uses simulated metrics)
+python3 monitor/detect.py
 ```
+
+### Environment Variables
+
+| Variable          | Purpose                              | Required |
+|-------------------|--------------------------------------|----------|
+| `COHERE_API_KEY`  | API key for the LLM agent            | Yes      |
+| `NOS_DEBUG`       | Set to `1` for verbose agent output  | No       |
+| `WASMTIME_CACHE_DIR` | Custom Wasmtime cache directory   | No       |
 
 ---
 
-## 🧪 Testing
+## Testing
 
 ### Run The Scripts
 
-Build the runtime first, then run each script against the sandbox binary. On Windows, use the `.exe` path; on Unix-like systems, use the release binary.
+Build the runtime first, then run each script against the sandbox binary:
 
 ```bash
 # Build once
@@ -443,23 +542,13 @@ cargo build --release
 ./target/release/ironclad-runtime tests/smoke/scripts/test_infinite.py
 ```
 
-Windows equivalents:
-
-```powershell
-cargo build --release
-.\target\release\ironclad-runtime.exe tests\smoke\scripts\test_normal.py
-.\target\release\ironclad-runtime.exe tests\smoke\scripts\test_network.py
-.\target\release\ironclad-runtime.exe tests\smoke\scripts\test_filesystem_escape.py
-.\target\release\ironclad-runtime.exe tests\smoke\scripts\test_infinite.py
-```
-
 If you want to run everything in one pass, use the smoke harness:
 
 ```bash
 python tests/smoke/run_smoke.py
 ```
 
-The runtime appends JSONL entries to `audit.log` for successful executions, so you can verify what ran after the scripts finish.
+The runtime appends JSONL entries to `scratch_repo/nos_audit.jsonl` for successful executions, so you can verify what ran after the scripts finish.
 
 ### Smoke Tests
 
@@ -486,25 +575,24 @@ exit(0)
 ```bash
 # Run it
 ./target/release/ironclad-runtime tests/smoke/scripts/my_test.py
-.\target\release\ironclad-runtime tests\smoke\scripts\my_test.py
 ```
 
 ---
 
-## 📈 Performance Tuning
+## Performance Tuning
 
 ### Fuel Budget
 
 Adjust CPU limit by modifying fuel in `src/main.rs`:
 
 ```rust
-// Current: 1M fuel ≈ 100ms
+// Current: 1M fuel = ~100ms
 store.add_fuel(1_000_000)?;
 
-// More generous: 5M fuel ≈ 500ms
+// More generous: 5M fuel = ~500ms
 store.add_fuel(5_000_000)?;
 
-// Very strict: 100K fuel ≈ 10ms
+// Very strict: 100K fuel = ~10ms
 store.add_fuel(100_000)?;
 ```
 
@@ -531,12 +619,12 @@ RUST_LOG=debug ./target/release/ironclad-runtime script.py
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### Issue: "Wasmtime cache unavailable"
 
 ```
-⚠️ WARN: Wasmtime cache unavailable, continuing without cache
+WARN: Wasmtime cache unavailable, continuing without cache
 ```
 
 **Solution:** The cache feature may not be compiled. Rebuild:
@@ -562,7 +650,16 @@ Error: Instance doesn't have any fuel to execute
 Your script tried to access outside `/sandbox`. This is intentional. Either:
 
 - Use `.sandbox/` directory only
+- Read `/proc/` for system metrics (mounted read-only)
 - Modify WASI context to allow other paths (not recommended for security)
+
+### Issue: eBPF import errors
+
+`monitor/detect.py` requires `sudo` for eBPF. Without root, it automatically skips BPF and uses simulated metrics. For real eBPF telemetry:
+
+```bash
+sudo python3 monitor/detect.py
+```
 
 ### Issue: Benchmarks show different numbers
 
@@ -577,7 +674,7 @@ Always run with `--warmup 5` flag and take median over 100+ iterations.
 
 ---
 
-## 🔬 Research & Publications
+## Research & Publications
 
 ### Citation
 
@@ -600,7 +697,7 @@ Full research paper draft available at [docs/6_Research_Paper.md](docs/6_Researc
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 We welcome contributions! Here's how:
 
@@ -623,7 +720,7 @@ pip install black ruff pytest
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Make your changes and test: `make test`
+3. Make your changes and test: `make smoke`
 4. Commit with clear messages: `git commit -am "feat: add X"`
 5. Push and open a PR
 
@@ -644,7 +741,7 @@ pip install black ruff pytest
 
 ---
 
-## 📋 License
+## License
 
 This project is licensed under the **MIT License** — see [LICENSE](LICENSE) for details.
 
@@ -652,34 +749,20 @@ In short: Use it for anything, anywhere. Just give attribution.
 
 ---
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - **Wasmtime** team for the JIT compiler and caching infrastructure
-- **LangGraph** for the ReAct agent framework
+- **Cohere** for the LLM API
 - **VMware Labs** for the Python-to-WASM compilation
 - **Rust community** for making systems programming accessible
 
 ---
 
-## 📞 Support & Community
+## Getting Started Checklist
 
-- **Issues & Bug Reports:** [GitHub Issues](https://github.com/yourusername/ironclad-agent/issues)
-- **Discussions & Q&A:** [GitHub Discussions](https://github.com/yourusername/ironclad-agent/discussions)
-- **Email:** your.email@example.com
-
----
-
-## 🎬 Getting Started Checklist
-
-- [ ] Read [docs/0_README.md](docs/0_README.md) for project overview
-- [ ] Follow [Quick Start](#-quick-start) above
-- [ ] Run `make test` to verify installation
+- [ ] Follow [Quick Start](#quick-start) above
+- [ ] Run `make smoke` to verify installation
+- [ ] Run `make demo` to see the full autonomous pipeline
 - [ ] Try a benchmark: `python tests/benchmarks/run_benchmark.py --iterations 10`
 - [ ] Read [docs/4_Architecture.md](docs/4_Architecture.md) to understand the internals
 - [ ] Examine [docs/8_WASM_CACHING_INTERNALS.md](docs/8_WASM_CACHING_INTERNALS.md) for CS-level deep dive
-
----
-
-**Made with ❤️ by the Ironclad team**
-
-⭐ If this helps you, consider starring the repo!

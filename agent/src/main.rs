@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::Prompt;
-use rig::providers::cohere;
+use rig::providers::groq;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -12,7 +12,7 @@ use std::fmt;
 // Agent state holds context for multi-turn reasoning sessions.
 #[allow(dead_code)]
 struct AgentState {
-    llm: cohere::Client,  // Cohere provider client for LLM calls.
+    llm: groq::Client,  // Cohere provider client for LLM calls.
     sandbox_path: String, // Path to ironclad-runtime binary.
     model: String,        // Model identifier (e.g., "command-r-plus").
     memory: Vec<String>,  // Conversation history for multi-turn context.
@@ -79,11 +79,28 @@ fn build_system_prompt() -> String {
 
     If code errors, analyze and retry ONCE.
 
-    ### SANDBOX CONSTRAINTS (WASM/WASI) ###
-    - No C-extensions: Packages like psutil, numpy, or pandas will fail. Use only pure-Python libraries or the standard library.
-    - No direct OS process APIs: os.getloadavg() and similar functions are not implemented in WASI.
-    - Diagnostic Strategy: To read system metrics (CPU, Memory, Load), you MUST read from /proc files directly using open(). 
-      Example: open('/proc/loadavg').read() or open('/proc/meminfo').read().
+    ### SANDBOX CONSTRAINTS (WASM/WASI) — STRICT, NON-NEGOTIABLE ###
+    - ABSOLUTELY NO C-extension packages. The following are BANNED and will CRASH:
+      psutil, numpy, pandas, scikit-learn, joblib, scipy, cryptography, lxml,
+      Pillow, PyYAML, greenlet, bcrypt, ujson, cffi, pydantic-core, any package with native/.so code.
+    - ONLY pure-Python packages work: python-dateutil, six, requests (no network), click, beautifulsoup4, etc.
+    - When in doubt, use ONLY the Python standard library (os, re, json, csv, math, collections, etc.).
+    - No subprocess, os.system(), or process spawning — WASI does not support fork/exec.
+    - /proc/ is mounted READ-ONLY in the sandbox. You CAN read system metrics from:
+      - /proc/stat (CPU usage), /proc/meminfo (memory), /proc/loadavg (load average)
+      - /proc/uptime, /proc/sys/fs/file-nr (file descriptors)
+      These are PLAIN TEXT files — do NOT use json.loads() on them. Parse with str.split() or str.startswith().
+      Example:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal') or line.startswith('MemAvailable'):
+                    key, value = line.split(':')
+                    kb = int(value.strip().split()[0])
+                    print(f'{key}: {kb // 1024} MB')
+        with open('/proc/loadavg') as f:
+            print('Load:', f.read().strip())
+    - If /proc/ reads fail, fall back to pure computation: print the anomaly details you were given
+      and compute what you can from math/collections (e.g., moving averages, thresholds).
     "#
     .to_string()
 }
@@ -300,7 +317,7 @@ fn format_rejection_summary(rejection: &serde_json::Value) -> String {
 // Perform one reasoning step with a single composed prompt.
 // This avoids provider-specific multi-message payload incompatibilities.
 async fn reason_once(
-    agent: &rig::agent::Agent<cohere::CompletionModel>,
+    agent: &rig::agent::Agent<groq::CompletionModel>,
     user_task: &str,
     scratchpad: &[String],
 ) -> Result<AgentTurn> {
@@ -403,6 +420,11 @@ fn extract_code_input(text: &str) -> Result<String> {
         let end_idx = after[..end_idx].find("Final Answer:").unwrap_or(end_idx);
         let code = after[..end_idx].trim().to_string();
         if !code.is_empty() {
+            // Strip markdown fences if present
+            let stripped = strip_markdown_fences(&code);
+            if !stripped.is_empty() {
+                return Ok(stripped);
+            }
             return Ok(code);
         }
     }
@@ -425,7 +447,22 @@ fn extract_code_input(text: &str) -> Result<String> {
     Err(anyhow::anyhow!("Could not extract code input"))
 }
 
-/// Extracts the manifest header fields from a diagnostic bash script.
+fn strip_markdown_fences(code: &str) -> String {
+    let trimmed = code.trim();
+    if trimmed.starts_with("```") {
+        // Find the first newline (language tag line)
+        if let Some(newline_pos) = trimmed.find('\n') {
+            let inner = &trimmed[newline_pos + 1..];
+            // Find the closing fence
+            if let Some(end_pos) = inner.rfind("```") {
+                return inner[..end_pos].trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+// Extracts the manifest header fields from a diagnostic bash script.
 /// Returns (fs_requires, purpose, timestamp).
 fn parse_script_manifest(code: &str) -> (Vec<String>, String, String) {
     let mut requires = Vec::new();
@@ -515,7 +552,8 @@ impl Tool for ExecuteCodeTool {
         // Write Python code to temp file.
         let mut file = fs::File::create(&temp_path)
             .map_err(|e| ToolError(format!("Failed to create temp file: {}", e)))?;
-        let (normalized_code, normalized_requires) = normalize_requires_comment(&args.code);
+        let (mut normalized_code, normalized_requires) = normalize_requires_comment(&args.code);
+        normalized_code = strip_markdown_fences(&normalized_code);
         file.write_all(normalized_code.as_bytes())
             .map_err(|e| ToolError(format!("Failed to write code: {}", e)))?;
 
@@ -570,14 +608,14 @@ async fn main() -> Result<()> {
     // Load environment variables from the workspace .env file.
     dotenvy::dotenv().ok();
 
-    // Initialize Cohere client from COHERE_API_KEY environment variable.
-    let client = cohere::Client::from_env();
+    // Initialize Groq client from GROQ_API_KEY environment variable.
+    let client = groq::Client::from_env();
 
     // Build Rig agent: model + system prompt + token limit.
-    // Note: We intentionally do NOT register tools at provider level for Cohere,
+    // Note: We intentionally do NOT register tools at provider level,
     // and instead execute tools manually from parsed ReAct actions.
     let agent = client
-        .agent("command-r-08-2024")
+        .agent("llama-3.3-70b-versatile")
         .preamble(&build_system_prompt())
         .max_tokens(2048)
         .build();
@@ -590,7 +628,7 @@ async fn main() -> Result<()> {
     // Scratchpad stores text-only turn summaries used to build the next prompt.
     let mut scratchpad: Vec<String> = Vec::new();
     let mut steps = 0;
-    const MAX_STEPS: usize = 30;
+    const MAX_STEPS: usize = 5;
 
     // ReAct loop: iterate until agent finishes or max steps reached.
     loop {

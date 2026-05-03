@@ -93,6 +93,8 @@ fn main() -> Result<()> {
 
     // Track the last modification time we handled
     let mut last_handled_mtime: Option<SystemTime> = None;
+    // Cooldown after invoking the agent to avoid rate limiting (30s)
+    let mut cooldown_until: Option<SystemTime> = None;
 
     loop {
         std::thread::sleep(Duration::from_secs(2));
@@ -122,12 +124,26 @@ fn main() -> Result<()> {
             Some(prev) => mtime > prev,
         };
 
+        // Skip if we're in cooldown after a recent agent invocation
+        if let Some(until) = cooldown_until {
+            if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                if let Ok(until_ts) = until.duration_since(std::time::UNIX_EPOCH) {
+                    if now < until_ts {
+                        continue;
+                    }
+                }
+            }
+            cooldown_until = None;
+        }
+
         if is_new {
             println!("\n📂 Alert file changed — reading...");
             last_handled_mtime = Some(mtime);
             if let Err(e) = handle_alert() {
                 eprintln!("❌ Error handling alert: {e}");
             }
+            // Cooldown: ignore new alerts for 30s to avoid LLM rate limiting
+            cooldown_until = Some(std::time::SystemTime::now() + Duration::from_secs(30));
         }
     }
 }
@@ -149,10 +165,12 @@ fn handle_alert() -> Result<()> {
 
     // 2. Build a task string for the agent.
     let task = format!(
-        "A system anomaly was detected: metric '{}' on process '{}' showed {} \
-         (anomaly score: {}, severity: {}). \
-         Write a Python script to diagnose this. Use the os and subprocess modules \
-         to check system resource usage (CPU, memory, open file descriptors). \
+        "These are SIMULATED metrics for testing — analyze the pattern, do NOT treat them as a real system problem. \
+         Metric '{}' on process '{}' showed {} (anomaly score: {}, severity: {}). \
+         Read /proc files (e.g., /proc/stat, /proc/meminfo, /proc/loadavg) to check current system resource usage, \
+         compare with the simulated anomaly values, and explain the pattern. \
+         Do NOT use subprocess, psutil, or os.system — they are not available in the WASM sandbox. \
+         Use only open() to read /proc/ files and the standard library. \
          Print a clear summary of findings.",
         alert["metric"],
         alert["process"],
@@ -170,14 +188,32 @@ fn handle_alert() -> Result<()> {
         }),
     )?;
 
-    // 4. Run ironclad-agent as a subprocess.
+    // 4. Run ironclad-agent as a subprocess and capture output.
     let bin = agent_bin();
     println!("🧠 Invoking {:?}...\n", bin);
-    let status = std::process::Command::new(&bin)
+    let output = std::process::Command::new(&bin)
         .arg(&task)
-        .status()
+        .output()
         .map_err(|e| anyhow::anyhow!("Failed to launch agent at {:?}: {}", bin, e))?;
 
-    println!("\n✅ Agent finished (exit {})", status.code().unwrap_or(-1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // 5. Log agent output to audit trail.
+    audit::write(
+        &audit_path(),
+        "AGENT_OUTPUT",
+        &serde_json::json!({
+            "exit_code": output.status.code().unwrap_or(-1),
+            "stdout_preview": stdout.lines().take(20).collect::<Vec<_>>().join("\n"),
+            "stderr": if stderr.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(stderr.to_string()) },
+        }),
+    )?;
+
+    println!("\n{}", stdout);
+    if !stderr.is_empty() {
+        eprintln!("Agent stderr:\n{}", stderr);
+    }
+    println!("\n✅ Agent finished (exit {})", output.status.code().unwrap_or(-1));
     Ok(())
 }

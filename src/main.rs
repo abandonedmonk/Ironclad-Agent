@@ -486,6 +486,18 @@ fn main() -> wasmtime::Result<()> {
         DirPerms::all(),
         FilePerms::all(),
     )?;
+
+    // /proc is mounted read-only so diagnostic scripts can read system metrics.
+    // Only DirPerms::READ and FilePerms::READ — no writes, no directory creation.
+    if std::path::Path::new("/proc").exists() {
+        let _ = wasi_builder.preopened_dir(
+            "/proc",
+            "/proc",
+            DirPerms::READ,
+            FilePerms::READ,
+        );
+    }
+
     wasi_builder.env("PYTHONPATH", &pythonpath);
 
     // ❌ Network is NOT granted: no socket permissions in WASI context

@@ -59,6 +59,9 @@ pub fn append_audit_entry(event_type: &str, detail: serde_json::Value) -> std::i
     let serialized = serde_json::to_string(&entry).unwrap();
     entry.entry_hash = hex::encode(Sha256::digest(serialized.as_bytes()));
 
+    if let Some(parent) = audit_path().parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file = OpenOptions::new()
         .append(true).create(true)
         .open(audit_path())?;
